@@ -482,33 +482,7 @@ bool TargetInfo::canUseStMatrix(RankedTensorType tensorTy,
                                 ArrayRef<unsigned> paddedRepShape,
                                 ArrayRef<unsigned> order,
                                 int swizzleByteSize) const {
-  if (computeCapability < 90) {
-    return false;
-  }
-  auto mmaLayout =
-      mlir::dyn_cast<NvidiaMmaEncodingAttr>(tensorTy.getEncoding());
-  if (!mmaLayout || !mmaLayout.isHopper())
-    return false;
-  if (isa<PointerType>(tensorTy.getElementType()))
-    return false;
-  if (tensorTy.getElementType().getIntOrFloatBitWidth() != 16)
-    return false;
-  if (order[0] != 1)
-    return false;
-
-  auto tensorShapePerCTA = getShapePerCTA(mmaLayout, tensorTy.getShape());
-  if (tensorShapePerCTA.size() != 2)
-    return false;
-  auto numIterations = ceil<unsigned>(tensorShapePerCTA[1], repShape[1]) *
-                       ceil<unsigned>(tensorShapePerCTA[0], repShape[0]);
-  if (numIterations > 1)
-    return false;
-  if (paddedRepShape[1] % 8 != 0)
-    return false;
-  if (swizzleByteSize != 0 && swizzleByteSize != 32 && swizzleByteSize != 64 &&
-      swizzleByteSize != 128)
-    return false;
-  return true;
+  return false;
 }
 
 void TargetInfo::storeMatrixShared(RewriterBase &rewriter, Location loc,

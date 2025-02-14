@@ -31,38 +31,6 @@ public:
     RankedTensorType dstTy = op.getType();
     Attribute srcLayout = srcTy.getEncoding();
     Attribute dstLayout = dstTy.getEncoding();
-    if (isa<DotOperandEncodingAttr>(dstLayout) &&
-        isa<NvidiaMmaEncodingAttr>(
-            cast<DotOperandEncodingAttr>(dstLayout).getParent())) {
-      auto dotEnc = cast<DotOperandEncodingAttr>(dstLayout);
-      auto mmaEnc = cast<NvidiaMmaEncodingAttr>(dotEnc.getParent());
-      auto sharedEnc = dyn_cast<SwizzledSharedEncodingAttr>(srcLayout);
-      if (!sharedEnc)
-        return failure();
-      auto bitwidth = dstTy.getElementTypeBitWidth();
-      auto vecWidth = 32 / bitwidth;
-      auto kWidth = dotEnc.getKWidth();
-      auto rank = dstTy.getRank();
-      auto kOrder = dotEnc.getOpIdx() == 0 ? rank - 1 : rank - 2;
-      auto nonKOrder = dotEnc.getOpIdx() == 0 ? rank - 2 : rank - 1;
-      auto needTrans = kOrder != sharedEnc.getOrder()[0];
-      // Limitation 1 [TODO: remove]: Check LL bases to verify register and
-      // address alignment
-      auto canUseLdmatrix = (kWidth == vecWidth);
-      canUseLdmatrix &= (sharedEnc.getMaxPhase() == 1) ||
-                        (sharedEnc.getVec() * bitwidth >= 8 * 16);
-      auto shape = srcTy.getShape();
-      // Limitation 2 [TODO: remove]: Only support 2d matrices now but we should
-      // be able to support 3D minor changes
-      canUseLdmatrix &= (bitwidth == 16 || !needTrans) && shape.size() <= 2;
-      // Limitation 3: Minimum tile size (8)x(8x16bits)
-      canUseLdmatrix &=
-          shape[kOrder] >= (8 * 16 / bitwidth) && shape[nonKOrder] >= 8;
-      if (canUseLdmatrix) {
-        return lowerSharedToDotOperand(op, adaptor, getTypeConverter(),
-                                       rewriter);
-      }
-    }
     return failure();
   }
 
