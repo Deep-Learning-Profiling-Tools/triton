@@ -298,32 +298,11 @@ struct ConvertLayoutOpUsingLinearLayoutsConversion
       //          This requires moving values through distributed shared memory.
       return rewriter.notifyMatchFailure(
           op, "NYI: Transfer between different CTAs");
-    } else if (llvm::is_contained(dims, kWarp)) {
-      // Case 2: Transfer between values in the same CTA, in which case we move
-      //         values through shared memory.
-      return transferWithinBlock(op, srcLayout, dstLayout, adaptor, rewriter);
-    } else if (llvm::is_contained(dims, kLane)) {
-      // Case 3. Transfer between values in the same warp, in which case we try
-      //         to move values using warp shuffles, though if the pattern is
-      //         complicated enough we may fall back to using shared memory
-      if (auto decomposedCvt =
-              getWarpLayoutConvertDecomposition(srcTy, dstTy)) {
-        transferWithinWarp(op, *decomposedCvt, adaptor, rewriter);
-        return success();
-      }
+    } else {
       // TODO: Since data is only transferred within a warp over shared memory,
       // we should use `bar.warp.sync` instead of `barrier`, which will improve
       // latency when warps issue barriers on different cycles.
       return transferWithinBlock(op, srcLayout, dstLayout, adaptor, rewriter);
-    } else if (llvm::is_contained(dims, kRegister)) {
-      // Case 4. Transfer between values in the same thread, in which case we
-      //         simply reorder the elements of adaptor.getSrc().
-      return transferWithinThread(op, conversion, adaptor, rewriter);
-    } else {
-      // Cast 5. The two layouts are equivalent. We should probably remove
-      // these in RemoveLayoutConversion.
-      rewriter.replaceOp(op, adaptor.getSrc());
-      return success();
     }
   }
 
