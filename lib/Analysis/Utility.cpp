@@ -540,110 +540,18 @@ bool supportMMA(Value value, int version) {
 }
 
 bool isBlockedToDotShortcut(RankedTensorType srcTy, RankedTensorType dstTy) {
-  auto blockedLayout = dyn_cast<BlockedEncodingAttr>(srcTy.getEncoding());
-  auto dotOperandLayout = dyn_cast<DotOperandEncodingAttr>(dstTy.getEncoding());
-  if (blockedLayout == nullptr || dotOperandLayout == nullptr)
-    return false;
-  auto parentLayout =
-      dyn_cast<BlockedEncodingAttr>(dotOperandLayout.getParent());
-  if (parentLayout == nullptr)
-    return false;
-  auto opShape = srcTy.getShape();
-  auto rank = opShape.size();
-
-  int kDim = dotOperandLayout.getOpIdx() == 0 ? rank - 1 : rank - 2;
-  int nonKDim = dotOperandLayout.getOpIdx() == 0 ? rank - 2 : rank - 1;
-  auto ctaLayout = blockedLayout.getCTALayout();
-
-  // The following logic checks that a source blocked layout matches a
-  // destination dot operand layout. This means that given tensor in source
-  // layout could be converted into destination layout without any data movement
-  // between registers or threads.
-  //
-  // It is considered a match if
-  // 1) Each thread in source layout holds a whole copy of all elements along
-  //    the K dimension of a tensor
-  // 2) Distribution of data along all other non-K dimensions(Batch/M/N)
-  //    matches between source and destination parent layouts.
-  //
-  // First condition comes from the property of dot operand layout with Blocked
-  // parent: size per threads along K dimension equals size of the tensor along
-  // K. Second condition comes from other property: dot operand layout
-  // inherits non-K dimensions from it's parent layout.
-  //
-  // clang-format off
-  //
-  // For example, following conversion is a no op:
-  //   tensor<128x32xf16,                          #blocked<{sizePerThread = [2, 32], threadsPerWarp = [32, 1]}>>
-  //     ->
-  //   tensor<128x32xf16, #dot_op<{opIdx=0, parent=#blocked<{sizePerThread = [2, 8], threadsPerWarp = [32, 1]}>>>
-  //
-  // clang-format on
-  bool ctaLayoutCompatible =
-      ctaLayout.getCTASplitNum()[kDim] == 1 &&
-      blockedLayout.getCTALayout() == parentLayout.getCTALayout();
-  bool threadHoldsWholeKDim =
-      blockedLayout.getSizePerThread()[kDim] == opShape[kDim];
-  bool nonKDimCompatible =
-      blockedLayout.getOrder() == parentLayout.getOrder() &&
-      blockedLayout.getSizePerThread()[nonKDim] ==
-          parentLayout.getSizePerThread()[nonKDim] &&
-      blockedLayout.getThreadsPerWarp()[nonKDim] ==
-          parentLayout.getThreadsPerWarp()[nonKDim] &&
-      blockedLayout.getWarpsPerCTA()[nonKDim] ==
-          parentLayout.getWarpsPerCTA()[nonKDim];
-  bool matrixDimsCompatible =
-      ctaLayoutCompatible && threadHoldsWholeKDim && nonKDimCompatible;
-  if (rank == 2)
-    return matrixDimsCompatible;
-
-  // additional check for batch dimension if it is present
-  assert(rank == 3);
-  bool bDimCompatible =
-      blockedLayout.getSizePerThread()[0] ==
-          parentLayout.getSizePerThread()[0] &&
-      blockedLayout.getThreadsPerWarp()[0] ==
-          parentLayout.getThreadsPerWarp()[0] &&
-      blockedLayout.getWarpsPerCTA()[0] == parentLayout.getWarpsPerCTA()[0];
-  return matrixDimsCompatible && bDimCompatible;
+  return false;
 }
 
 // For MMAV3 dotOperand layout matches mma operand for f16 and bf16 cases.
 bool matchMmaV3AndDotOperandLayout(RankedTensorType srcTy,
                                    RankedTensorType dstTy) {
-  auto mmaLayout = dyn_cast<NvidiaMmaEncodingAttr>(srcTy.getEncoding());
-  auto dotOperandLayout = dyn_cast<DotOperandEncodingAttr>(dstTy.getEncoding());
-  if (!mmaLayout || !dotOperandLayout) {
-    return false;
-  }
-  int elementTypeSize = srcTy.getElementType().getIntOrFloatBitWidth();
-  auto parentTy = RankedTensorType::get(
-      srcTy.getShape(), srcTy.getElementType(), dotOperandLayout.getParent());
-  auto ans = mmaLayout.getVersionMajor() == 3 &&
-             dotOperandLayout.getOpIdx() == 0 &&
-             mmaLayout.getWarpsPerCTA()[1] == 1 &&
-             !cvtNeedsSharedMemory(parentTy, srcTy) && elementTypeSize == 8 &&
-             dotOperandLayout.getKWidth() == 32 / elementTypeSize;
-  return ans;
+  return false;
 }
 
 bool matchMFMAAndDotOperandShuffleCase(RankedTensorType srcTy,
                                        RankedTensorType dstTy) {
-  auto mfmaLayout = dyn_cast<AMDMfmaEncodingAttr>(srcTy.getEncoding());
-  auto dotOperandLayout = dyn_cast<DotOperandEncodingAttr>(dstTy.getEncoding());
-  if (!mfmaLayout || !dotOperandLayout)
-    return false;
-
-  // Currently supporting 32x32 and 16x16 FP8 MFMA -> dot operand case
-  return dotOperandLayout.getParent() == mfmaLayout &&
-         dotOperandLayout.getOpIdx() == 0 && mfmaLayout.getIsTransposed() &&
-         dotOperandLayout.getKWidth() == 8 &&
-         getContigPerThread(mfmaLayout)[1] == 4 &&
-         ((mfmaLayout.getMDim() == 16 && mfmaLayout.getNDim() == 16) ||
-          (mfmaLayout.getMDim() == 32 && mfmaLayout.getNDim() == 32)) &&
-         triton::type::isFloat8(srcTy.getElementType()) &&
-         triton::type::isFloat8(dstTy.getElementType()) &&
-         mfmaLayout.getWarpsPerCTA()[1] == 1;
+  return false;
 }
 
 // We get the smallest submap of srcTy^{-1} * dstTy that is not the identity
