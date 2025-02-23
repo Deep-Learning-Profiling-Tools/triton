@@ -3727,6 +3727,9 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
             b = unshuffle(b, op_idx=1)
 
         c = tl.dot_scaled(a, a_scale, type_a, b, b_scale, type_b)
+        for _ in range(10):
+            c += tl.dot_scaled(a, a_scale, type_a, b, b_scale, type_b)
+
         out_ptr = out + \
             tl.arange(0, BLOCK_M)[:, None] * BLOCK_N + \
             tl.arange(0, BLOCK_N)[None, :]
