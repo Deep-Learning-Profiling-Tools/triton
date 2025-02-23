@@ -3915,9 +3915,11 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
         kernel_kwargs["kpack"] = kpack
         kernel_kwargs["matrix_instr_nonkdim"] = mma
     z = x.new_empty((M, N), dtype=comp_dtype)
+    z_ref = dot_scale_ref(x, scale_x, y, scale_y, type_a, type_b)
+    if type_b == "e2m1":
+        y = shuffle(y, op_idx=1)
     pgm = dot_scale_kernel[(1, )](x, *x.stride(), scale_x, y, *y.stride(), scale_y, z, M, N, K, type_a, type_b,
                                   **kernel_kwargs)
-    z_ref = dot_scale_ref(x, scale_x, y, scale_y, type_a, type_b)
     # Bigger tolerance for AMD MI200 devices.
     # MI200 devices use reduced precision fp16 and bf16 and flush input and output denormal values
     # to zero. Detailed info is at:
