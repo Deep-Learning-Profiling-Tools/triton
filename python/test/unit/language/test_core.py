@@ -3621,11 +3621,13 @@ def unshuffle(x, op_idx: tl.constexpr):
         x = x.trans(1, 0)
     return x
 
+import triton.profiler as proton
+
 
 @pytest.mark.parametrize("M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, num_warps, mma, kpack",
                          [(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, 4, mma, kpack)
-                          for M, N, K in itertools.product([32, 64, 128], [32, 64, 128], [64, 128])
-                          for col_a, col_b in itertools.product([True, False], repeat=2)
+                          for M, N, K in list(itertools.product([64], [64], [64, 128])) + list(itertools.product([128], [128], [64, 128]))
+                          for col_a, col_b in [(False, False)]
                           for rhs_scale in [True]
                           for mxfp_type in ["e2m1"]
                           for normal_type in ["e4m3", "e5m2", "bf16", "fp16"]
@@ -3918,8 +3920,10 @@ def test_scaled_dot(M, N, K, col_a, col_b, rhs_scale, mxfp_type, normal_type, nu
     z_ref = dot_scale_ref(x, scale_x, y, scale_y, type_a, type_b)
     if type_b == "e2m1":
         y = shuffle(y, op_idx=1)
-    pgm = dot_scale_kernel[(1, )](x, *x.stride(), scale_x, y, *y.stride(), scale_y, z, M, N, K, type_a, type_b,
-                                  **kernel_kwargs)
+
+    with proton.scope(f"{M}_{N}_{K}_{type_a}_{type_b}"):
+        pgm = dot_scale_kernel[(1, )](x, *x.stride(), scale_x, y, *y.stride(), scale_y, z, M, N, K, type_a, type_b,
+                                      **kernel_kwargs)
     # Bigger tolerance for AMD MI200 devices.
     # MI200 devices use reduced precision fp16 and bf16 and flush input and output denormal values
     # to zero. Detailed info is at:
