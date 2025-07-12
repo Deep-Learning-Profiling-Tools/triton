@@ -501,37 +501,16 @@ bool supportMMA(Value value, int version) {
 // For MMAV3 dotOperand layout matches mma operand for f16 and bf16 cases.
 bool matchMmaV3AndDotOperandLayout(RankedTensorType srcTy,
                                    RankedTensorType dstTy) {
-  auto mmaLayout = dyn_cast<NvidiaMmaEncodingAttr>(srcTy.getEncoding());
-  auto dotOperandLayout = dyn_cast<DotOperandEncodingAttr>(dstTy.getEncoding());
-  if (!mmaLayout || !dotOperandLayout) {
-    return false;
-  }
-  int elementTypeSize = srcTy.getElementType().getIntOrFloatBitWidth();
-  auto parentTy = srcTy.cloneWithEncoding(dotOperandLayout.getParent());
-  auto ans = mmaLayout.getVersionMajor() == 3 &&
-             dotOperandLayout.getOpIdx() == 0 &&
-             mmaLayout.getWarpsPerCTA()[1] == 1 &&
-             !cvtNeedsSharedMemory(parentTy, srcTy) && elementTypeSize == 8 &&
-             dotOperandLayout.getKWidth() == 32 / elementTypeSize;
-  return ans;
+  return false;
+}
+
+bool isBlockedToDotShortcut(RankedTensorType srcTy, RankedTensorType dstTy) {
+  return false;
 }
 
 bool matchMFMAAndDotOperandShuffleCase(RankedTensorType srcTy,
                                        RankedTensorType dstTy) {
-  auto mfmaLayout = dyn_cast<AMDMfmaEncodingAttr>(srcTy.getEncoding());
-  auto dotOperandLayout = dyn_cast<DotOperandEncodingAttr>(dstTy.getEncoding());
-  if (!mfmaLayout || !dotOperandLayout)
-    return false;
-
-  // Currently supporting 32x32 and 16x16 FP8 MFMA -> dot operand case
-  return dotOperandLayout.getParent() == mfmaLayout &&
-         dotOperandLayout.getOpIdx() == 0 && mfmaLayout.getIsTransposed() &&
-         dotOperandLayout.getKWidth() == 8 &&
-         ((mfmaLayout.getMDim() == 16 && mfmaLayout.getNDim() == 16) ||
-          (mfmaLayout.getMDim() == 32 && mfmaLayout.getNDim() == 32)) &&
-         triton::type::isFloat8(srcTy.getElementType()) &&
-         triton::type::isFloat8(dstTy.getElementType()) &&
-         mfmaLayout.getWarpsPerCTA()[1] == 1;
+  return false;
 }
 
 // We get the smallest submap of srcTy^{-1} * dstTy that is not the identity
