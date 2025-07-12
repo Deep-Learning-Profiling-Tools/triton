@@ -4,9 +4,6 @@
 
 #include "mlir/Analysis/DataFlow/ConstantPropagationAnalysis.h"
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
-#include "mlir/Conversion/LLVMCommon/Pattern.h"
-#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/Dialect.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Support/LLVM.h"
@@ -16,7 +13,6 @@
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
-#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
@@ -26,14 +22,8 @@ namespace mlir {
 using namespace triton;
 using namespace triton::gpu;
 
-// TODO(jlebar): Move this class into namespace triton.
-bool ReduceOpHelper::isReductionOnLayoutFastAxis() {
-  auto linearEncoding = toLinearEncoding(getSrcLayout(), getSrcShape());
-  return linearEncoding.getOrder()[0] == axis;
-}
-
 SmallVector<unsigned> ReduceOpHelper::getOrderWithAxisAtBeginning() {
-  auto order = toLinearEncoding(getSrcLayout(), getSrcShape()).getOrder();
+  auto order = toLinearEncoding(srcTy).getOrder();
   auto it = std::find(order.begin(), order.end(), axis);
   // delete the axis from order
   order.erase(it);
@@ -45,10 +35,8 @@ SmallVector<unsigned> ReduceOpHelper::getOrderWithAxisAtBeginning() {
 // Thread offset is the thread index offset of two adjacent threads on the
 // reduction axis within the warp.
 unsigned ReduceOpHelper::getThreadOffsetOnReductionAxis() {
-  auto srcLayout = getSrcLayout();
-  auto *ctx = srcLayout.getContext();
-  auto linearLayout = toLinearLayout(getSrcShape(), srcLayout);
-  auto axis = getAxis();
+  auto *ctx = srcEncoding.getContext();
+  auto linearLayout = toLinearLayout(srcTy);
   auto kLane = mlir::StringAttr::get(ctx, "lane");
   const auto &bases = linearLayout.getBases();
   const auto &lanes = bases.find(kLane)->second;
@@ -106,56 +94,25 @@ bool shouldUseDistSmem(Attribute srcLayout, Attribute dstLayout) {
   return true;
 }
 
-unsigned ReduceOpHelper::getInterWarpSize() {
-  auto srcReduceDimSize = static_cast<unsigned>(srcShape[axis]);
-  unsigned sizeIntraWarps = getIntraWarpSize();
-  return std::min(srcReduceDimSize / sizeIntraWarps,
-                  getWarpsPerCTA(getSrcLayout())[axis]);
-}
-
-unsigned ReduceOpHelper::getIntraWarpSize() {
-  auto srcReduceDimSize = static_cast<unsigned>(srcShape[axis]);
-  return std::min(srcReduceDimSize, getThreadsPerWarp(getSrcLayout())[axis]);
-}
-
 unsigned ReduceOpHelper::getInterWarpSizeWithUniqueData() {
-  auto srcReduceDimSize = static_cast<unsigned>(srcShape[axis]);
-  unsigned sizeIntraWarps = getIntraWarpSizeWithUniqueData();
-  return std::min(
-      srcReduceDimSize / sizeIntraWarps,
-      getWarpsPerCTAWithUniqueData(getSrcLayout(), getSrcShape())[axis]);
+  return getWarpsPerCTA(srcEncoding, srcShape)[axis];
 }
 
 unsigned ReduceOpHelper::getIntraWarpSizeWithUniqueData() {
-  auto srcReduceDimSize = static_cast<unsigned>(srcShape[axis]);
-  unsigned elementPerThreads =
-      getUniqueContigPerThread(getSrcLayout(), getSrcShape())[axis];
-  return std::min(
-      srcReduceDimSize / elementPerThreads,
-      getThreadsPerWarpWithUniqueData(getSrcLayout(), getSrcShape())[axis]);
-}
-
-unsigned ReduceOpHelper::getThreadsReductionAxis() {
-  auto axis = getAxis();
-  auto *ctx = getSrcLayout().getContext();
-  auto ll = LinearEncodingAttr::get(
-      ctx, toLinearLayout(getSrcShape(), getSrcLayout()));
-  return ll.getThreadsPerWarp()[axis] * ll.getWarpsPerCTA()[axis];
+  return getThreadsPerWarp(srcEncoding, srcShape)[axis];
 }
 
 bool ReduceOpHelper::isWarpSynchronous() {
-  auto srcLayout = getSrcLayout();
-  auto srcShape = getSrcShape();
-  return getWarpsPerCTAWithUniqueData(srcLayout, srcShape)[axis] == 1;
+  return getWarpsPerCTA(srcEncoding, srcShape)[axis] == 1;
 }
 
 SmallVector<unsigned> ReduceOpHelper::getScratchRepShape() {
   SmallVector<unsigned> smemShape;
-  // that case doesn't need inter-warp communication
+  // This case doesn't need inter-warp communication
   if (isWarpSynchronous())
     return {0, 0};
 
-  smemShape = convertType<unsigned>(getSrcShape());
+  smemShape = convertType<unsigned>(srcShape);
   smemShape[axis] = getInterWarpSizeWithUniqueData();
 
   return smemShape;
@@ -173,30 +130,30 @@ unsigned ReduceOpHelper::getScratchSizeInBytes() {
 }
 
 bool ReduceOpHelper::isReduceWithinCTA() {
-  auto axis = getAxis();
-  auto srcLayout = getSrcLayout();
-  auto CTASplitNum = getCTASplitNum(srcLayout);
-  assert(axis < CTASplitNum.size());
-  return CTASplitNum[axis] == 1;
-}
-
-bool ReduceOpHelper::isSupportedLayout() {
+  // TODO: Support reduce across CTAS
   // Layout optimization passes such as PlanCTAPass and
   // RemoveLayoutConversionPass should avoid cross-CTA reduction
-  if (!isReduceWithinCTA()) {
-    return false;
-  }
+  return getCTASplitNum(srcEncoding)[axis] == 1;
+}
 
-  auto srcLayout = getSrcLayout();
-  if (isa<BlockedEncodingAttr, LinearEncodingAttr, SliceEncodingAttr>(
-          srcLayout)) {
+bool ReduceOpHelper::isAssociative() {
+  auto dtype = srcElementTypes[0];
+  if (!type::isFloat(dtype))
     return true;
-  }
-
-  if (auto mmaLayout = dyn_cast<MmaEncodingTrait>(srcLayout)) {
-    return mmaLayout.supportReduction();
-  }
-  return false;
+  size_t reduce_size = srcShape[axis];
+  if (reduce_size <= 2)
+    return true;
+  bool hasNoAssociativeOp = false;
+  op.walk([&](Operation *nestedOp) -> WalkResult {
+    if (isa<arith::AddFOp, arith::MulFOp>(nestedOp)) {
+      // Only when the data type is float point and reduce size greater than 2,
+      // and has addf or mulf op, we though it's a non-associative reduce.
+      hasNoAssociativeOp = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return !hasNoAssociativeOp;
 }
 
 unsigned ScanLoweringHelper::getAxisNumElementsPerThread() {
@@ -233,8 +190,8 @@ unsigned ScanLoweringHelper::getAxisNumWarpsWithUniqueData() {
 
 unsigned ScanLoweringHelper::getAxisNumBlocks() {
   auto contigPerThread = getEncoding().getContigPerThread();
-  auto threadsPerWarp = getThreadsPerWarp(getEncoding());
-  auto warpsPerCTA = getWarpsPerCTA(getEncoding());
+  auto threadsPerWarp = getEncoding().getThreadsPerWarp();
+  auto warpsPerCTA = getEncoding().getWarpsPerCTA();
   unsigned axis = getAxis();
   return ceil<unsigned>(
       getShape()[axis],
@@ -243,8 +200,8 @@ unsigned ScanLoweringHelper::getAxisNumBlocks() {
 
 unsigned ScanLoweringHelper::getNonAxisNumBlocks() {
   auto contigPerThread = getEncoding().getContigPerThread();
-  auto threadsPerWarp = getThreadsPerWarp(getEncoding());
-  auto warpsPerCTA = getWarpsPerCTA(getEncoding());
+  auto threadsPerWarp = getEncoding().getThreadsPerWarp();
+  auto warpsPerCTA = getEncoding().getWarpsPerCTA();
   auto rank = contigPerThread.size();
   unsigned axis = getAxis();
   unsigned numBlocks = 1;
@@ -365,8 +322,8 @@ unsigned ScanLoweringHelper::getAxisBlockStride() {
   auto order = getOrder();
   unsigned stride = 1;
   auto contigPerThread = getEncoding().getContigPerThread();
-  auto threadsPerWarp = getThreadsPerWarp(getEncoding());
-  auto warpsPerCTA = getWarpsPerCTA(getEncoding());
+  auto threadsPerWarp = getEncoding().getThreadsPerWarp();
+  auto warpsPerCTA = getEncoding().getWarpsPerCTA();
   for (unsigned dim : order) {
     if (dim == getAxis())
       return stride;
@@ -398,10 +355,8 @@ bool GatherLoweringHelper::isWarpLocal() {
   // source and index tensors, all the elements are owned by the same warp.
   RankedTensorType srcType = gatherOp.getSrc().getType();
   RankedTensorType idxType = gatherOp.getIndices().getType();
-  LinearLayout srcLayout =
-      toLinearLayout(srcType.getShape(), srcType.getEncoding());
-  LinearLayout idxLayout =
-      toLinearLayout(idxType.getShape(), idxType.getEncoding());
+  LinearLayout srcLayout = toLinearLayout(srcType);
+  LinearLayout idxLayout = toLinearLayout(idxType);
 
   Builder b(gatherOp.getContext());
   StringAttr kBlock = b.getStringAttr("block");
@@ -482,7 +437,11 @@ bool supportMMA(triton::DotOp op, int version) {
       return false;
     if (op.getType().getRank() != 2)
       return false;
-    if (!(numWarps % 4 == 0 && retShapePerCTA[rank - 2] % 64 == 0 &&
+    if (numWarps != 4 && numWarps != 8) {
+      // Currently only support numWarps 4 or 8 for TMEM load and store.
+      return false;
+    }
+    if (!(retShapePerCTA[rank - 2] % 64 == 0 &&
           retShapePerCTA[rank - 1] % 8 == 0))
       return false;
     return true;
@@ -535,77 +494,8 @@ bool supportMMA(Value value, int version) {
   bool isFP8 = llvm::isa<Float8E5M2Type, Float8E4M3FNType, Float8E5M2FNUZType,
                          Float8E4M3FNUZType>(elemTy);
   return isFP8 || elemTy.isF16() || elemTy.isBF16() ||
-         (elemTy.isF32() && version >= 2) ||
+         ((elemTy.isF32() || elemTy.isF64()) && version >= 2) ||
          (elemTy.isInteger(8) && version >= 2);
-}
-
-bool isBlockedToDotShortcut(RankedTensorType srcTy, RankedTensorType dstTy) {
-  auto blockedLayout = dyn_cast<BlockedEncodingAttr>(srcTy.getEncoding());
-  auto dotOperandLayout = dyn_cast<DotOperandEncodingAttr>(dstTy.getEncoding());
-  if (blockedLayout == nullptr || dotOperandLayout == nullptr)
-    return false;
-  auto parentLayout =
-      dyn_cast<BlockedEncodingAttr>(dotOperandLayout.getParent());
-  if (parentLayout == nullptr)
-    return false;
-  auto opShape = srcTy.getShape();
-  auto rank = opShape.size();
-
-  int kDim = dotOperandLayout.getOpIdx() == 0 ? rank - 1 : rank - 2;
-  int nonKDim = dotOperandLayout.getOpIdx() == 0 ? rank - 2 : rank - 1;
-  auto ctaLayout = blockedLayout.getCTALayout();
-
-  // The following logic checks that a source blocked layout matches a
-  // destination dot operand layout. This means that given tensor in source
-  // layout could be converted into destination layout without any data movement
-  // between registers or threads.
-  //
-  // It is considered a match if
-  // 1) Each thread in source layout holds a whole copy of all elements along
-  //    the K dimension of a tensor
-  // 2) Distribution of data along all other non-K dimensions(Batch/M/N)
-  //    matches between source and destination parent layouts.
-  //
-  // First condition comes from the property of dot operand layout with Blocked
-  // parent: size per threads along K dimension equals size of the tensor along
-  // K. Second condition comes from other property: dot operand layout
-  // inherits non-K dimensions from it's parent layout.
-  //
-  // clang-format off
-  //
-  // For example, following conversion is a no op:
-  //   tensor<128x32xf16,                          #blocked<{sizePerThread = [2, 32], threadsPerWarp = [32, 1]}>>
-  //     ->
-  //   tensor<128x32xf16, #dot_op<{opIdx=0, parent=#blocked<{sizePerThread = [2, 8], threadsPerWarp = [32, 1]}>>>
-  //
-  // clang-format on
-  bool ctaLayoutCompatible =
-      ctaLayout.getCTASplitNum()[kDim] == 1 &&
-      blockedLayout.getCTALayout() == parentLayout.getCTALayout();
-  bool threadHoldsWholeKDim =
-      blockedLayout.getSizePerThread()[kDim] == opShape[kDim];
-  bool nonKDimCompatible =
-      blockedLayout.getOrder() == parentLayout.getOrder() &&
-      blockedLayout.getSizePerThread()[nonKDim] ==
-          parentLayout.getSizePerThread()[nonKDim] &&
-      blockedLayout.getThreadsPerWarp()[nonKDim] ==
-          parentLayout.getThreadsPerWarp()[nonKDim] &&
-      blockedLayout.getWarpsPerCTA()[nonKDim] ==
-          parentLayout.getWarpsPerCTA()[nonKDim];
-  bool matrixDimsCompatible =
-      ctaLayoutCompatible && threadHoldsWholeKDim && nonKDimCompatible;
-  if (rank == 2)
-    return matrixDimsCompatible;
-
-  // additional check for batch dimension if it is present
-  assert(rank == 3);
-  bool bDimCompatible =
-      blockedLayout.getSizePerThread()[0] ==
-          parentLayout.getSizePerThread()[0] &&
-      blockedLayout.getThreadsPerWarp()[0] ==
-          parentLayout.getThreadsPerWarp()[0] &&
-      blockedLayout.getWarpsPerCTA()[0] == parentLayout.getWarpsPerCTA()[0];
-  return matrixDimsCompatible && bDimCompatible;
 }
 
 // For MMAV3 dotOperand layout matches mma operand for f16 and bf16 cases.
@@ -617,8 +507,7 @@ bool matchMmaV3AndDotOperandLayout(RankedTensorType srcTy,
     return false;
   }
   int elementTypeSize = srcTy.getElementType().getIntOrFloatBitWidth();
-  auto parentTy = RankedTensorType::get(
-      srcTy.getShape(), srcTy.getElementType(), dotOperandLayout.getParent());
+  auto parentTy = srcTy.cloneWithEncoding(dotOperandLayout.getParent());
   auto ans = mmaLayout.getVersionMajor() == 3 &&
              dotOperandLayout.getOpIdx() == 0 &&
              mmaLayout.getWarpsPerCTA()[1] == 1 &&
@@ -638,7 +527,6 @@ bool matchMFMAAndDotOperandShuffleCase(RankedTensorType srcTy,
   return dotOperandLayout.getParent() == mfmaLayout &&
          dotOperandLayout.getOpIdx() == 0 && mfmaLayout.getIsTransposed() &&
          dotOperandLayout.getKWidth() == 8 &&
-         getContigPerThread(mfmaLayout)[1] == 4 &&
          ((mfmaLayout.getMDim() == 16 && mfmaLayout.getNDim() == 16) ||
           (mfmaLayout.getMDim() == 32 && mfmaLayout.getNDim() == 32)) &&
          triton::type::isFloat8(srcTy.getElementType()) &&
@@ -647,27 +535,32 @@ bool matchMFMAAndDotOperandShuffleCase(RankedTensorType srcTy,
 }
 
 // We get the smallest submap of srcTy^{-1} * dstTy that is not the identity
-// under kBlock, kWarp or kLane (in that order). The idea here is that if we
-// have a transformation that's the identity on kBlock, we don't need to use
+// under the common dimensions. The idea here is that if we have a
+// transformation that's the identity on kBlock, we don't need to use
 // distributed shared memory. If it's also the identity on kWarp, we can
 // transfer via warp-shuffles, and if it's the identity on kLane just have to
-// reorder the registers
-LinearLayout minimalCvtLayout(RankedTensorType srcTy, RankedTensorType dstTy) {
-  MLIRContext *ctx = srcTy.getContext();
-  LinearLayout srcLayout =
-      toLinearLayout(srcTy.getShape(), srcTy.getEncoding());
-  LinearLayout dstLayout =
-      toLinearLayout(dstTy.getShape(), dstTy.getEncoding());
-  StringAttr kRegister = StringAttr::get(ctx, "register");
-  StringAttr kLane = StringAttr::get(ctx, "lane");
-  StringAttr kWarp = StringAttr::get(ctx, "warp");
-  StringAttr kBlock = StringAttr::get(ctx, "block");
+// reorder the registers.
+LinearLayout minimalCvtLayout(Type srcTy_, Type dstTy_) {
+  auto srcTy = cast<triton::gpu::TensorOrMemDesc>(srcTy_);
+  auto dstTy = cast<triton::gpu::TensorOrMemDesc>(dstTy_);
+  LinearLayout srcLayout = toLinearLayout(srcTy);
+  LinearLayout dstLayout = toLinearLayout(dstTy);
+  auto sDims = to_vector(srcLayout.getInDimNames());
+  auto dDims = to_vector(dstLayout.getInDimNames());
+  SmallVector<StringAttr> dims;
+  for (int i = 0; i < std::min(sDims.size(), dDims.size()); ++i) {
+    auto srcDim = sDims[sDims.size() - i - 1];
+    auto dstDim = dDims[dDims.size() - i - 1];
+    if (srcDim != dstDim) {
+      break;
+    }
+    dims.push_back(srcDim);
+  }
 
   auto comp = dstLayout.invertAndCompose(srcLayout);
-  // We try to quotient by the largest subspace first
-  auto dims = SmallVector<StringRef>{"block", "warp", "lane", "register"};
+  // We try to quotient by the slowers moving subspace first
   for (auto dim : dims) {
-    auto quotient = comp.quotient(StringAttr::get(ctx, dim));
+    auto quotient = comp.quotient(dim);
     if (!quotient.has_value()) {
       break;
     }
@@ -685,13 +578,11 @@ bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy) {
 }
 
 bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy) {
-  // TODO(jlebar): Remove these special cases (`isBlockedToDotShortcut` and
-  // `isMfmaToDotShortcut`) once they're fully subsumed by the linear-layout
-  // checks.
+  // TODO(jlebar): Remove these special cases `isMfmaToDotShortcut` once
+  // they're fully subsumed by the linear-layout checks.
   return !cvtReordersRegisters(srcTy, dstTy) &&
          !(cvtNeedsWarpShuffle(srcTy, dstTy) &&
            getWarpLayoutConvertDecomposition(srcTy, dstTy)) &&
-         !isBlockedToDotShortcut(srcTy, dstTy) &&
          !matchMmaV3AndDotOperandLayout(srcTy, dstTy) &&
          // to be removed when generalized warp shuffle conversions
          // are ready:
@@ -853,7 +744,7 @@ SetVector<Operation *> multiRootGetSlice(Operation *op,
     BackwardSliceOptions opt;
     opt.omitBlockArguments = true;
     opt.filter = backwardFilter;
-    getBackwardSlice(currentOp, &backwardSlice, opt);
+    (void)getBackwardSlice(currentOp, &backwardSlice, opt);
     slice.insert(backwardSlice.begin(), backwardSlice.end());
 
     // Compute and insert the forwardSlice starting from currentOp.
@@ -923,77 +814,6 @@ std::unique_ptr<DataFlowSolver> createDataFlowSolver() {
   solver->load<dataflow::DeadCodeAnalysis>();
   solver->load<ConstantAnalysis>();
   return solver;
-}
-
-static MakeTensorPtrOp getMakeTensorPtrOpImpl(Operation *op, Value v) {
-
-  if (auto makeTensorPtrOp = dyn_cast<MakeTensorPtrOp>(op)) {
-    return makeTensorPtrOp;
-  }
-
-  if (auto advanceOp = dyn_cast<AdvanceOp>(op)) {
-    return getMakeTensorPtrOp(advanceOp.getPtr());
-  }
-
-  if (auto branch = dyn_cast<RegionBranchOpInterface>(op)) {
-    auto idx = cast<OpResult>(v).getResultNumber();
-    llvm::SmallVector<scf::YieldOp> yieldOps;
-    op->walk([&](Operation *op) {
-      if (auto yieldOp = dyn_cast<scf::YieldOp>(op))
-        yieldOps.push_back(yieldOp);
-    });
-
-    // benzh@ if multi yields, all yields operand should come from same arg.
-    Value newValue = yieldOps[0].getOperands()[idx];
-    return getMakeTensorPtrOp(newValue);
-  }
-
-  llvm_unreachable("Unable to getMakeTensorPtr()");
-}
-
-MakeTensorPtrOp getMakeTensorPtrOp(Value v) {
-  using BranchOps = llvm::SetVector<std::pair<Operation *, int>>;
-  llvm::DenseMap<Block *, BranchOps> blockToCFOps;
-  auto moduleOp =
-      v.getParentBlock()->getParentOp()->getParentOfType<ModuleOp>();
-
-  moduleOp.walk([&](Operation *op) {
-    if (auto br = dyn_cast<cf::BranchOp>(op)) {
-      Block *block = br.getDest();
-      blockToCFOps[block].insert({op, -1});
-    }
-    if (auto condBr = dyn_cast<cf::CondBranchOp>(op)) {
-      Block *blockT = condBr.getTrueDest();
-      Block *blockF = condBr.getFalseDest();
-      blockToCFOps[blockT].insert({condBr, 1});
-      blockToCFOps[blockF].insert({condBr, 0});
-    }
-  });
-
-  if (Operation *definingOp = v.getDefiningOp())
-    return getMakeTensorPtrOpImpl(definingOp, v);
-
-  // If there is no defining op, v must be a BlockArgument.
-  BlockArgument arg = cast<BlockArgument>(v);
-  unsigned argNum = arg.getArgNumber();
-  Operation *argOwner = arg.getOwner()->getParentOp();
-
-  if (auto forOp = dyn_cast<scf::ForOp>(argOwner))
-    return getMakeTensorPtrOp(
-        forOp.getOperand(argNum + forOp.getNumControlOperands() - 1));
-  if (auto funcOp = dyn_cast<FunctionOpInterface>(argOwner)) {
-    Block *block = arg.getOwner();
-    Operation *op;
-    int tOrF;
-    std::tie(op, tOrF) = blockToCFOps[block][0];
-    if (auto br = dyn_cast<cf::BranchOp>(op))
-      return getMakeTensorPtrOp(br.getDestOperands()[argNum]);
-    if (auto condBr = dyn_cast<cf::CondBranchOp>(op))
-      return getMakeTensorPtrOp(tOrF ? condBr.getTrueDestOperands()[argNum]
-                                     : condBr.getFalseDestOperands()[argNum]);
-    return getMakeTensorPtrOp(argOwner->getOperand(argNum));
-  }
-  llvm_unreachable("Unable to getMakeTensorPtr()");
 }
 
 } // namespace mlir

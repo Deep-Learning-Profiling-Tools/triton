@@ -21,7 +21,7 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 #include "../PatternTritonGPUOpToLLVM.h"
-#include "../TritonAMDGPUToLLVM/SchedInstructions.h"
+#include "AsyncUtility.h"
 #include "SharedToDotOperandHelper.h"
 #include "Utility.h"
 
@@ -199,6 +199,17 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
                     Location loc, Value tensor, DotOperandEncodingAttr encoding,
                     const SharedMemoryObject &smemObj,
                     const LLVMTypeConverter *typeConverter, Value thread) {
+  // We observe mismatches going down this path for scaled dot operations.
+  // However, these mismatches do not occur when the conversion is performed via
+  // LL, which is the preferred anyway.
+  // TODO: Deprecate and remove this path once fixing LLM performance issues.
+  for (auto op : tensor.getUsers()) {
+    if (auto localLoadOp = llvm::dyn_cast<triton::gpu::LocalLoadOp>(op)) {
+      if (mlir::LLVM::AMD::isUsedByDotScaledOp(op))
+        return Value();
+    }
+  }
+
   auto tb = TritonLLVMOpBuilder(loc, rewriter);
   assert((opIdx == 0 || opIdx == 1) && "unexpected operand idx");
   auto aTensorTy = cast<triton::gpu::MemDescType>(tensor.getType());
@@ -208,16 +219,29 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
   int nonKDimIdx = opIdx == 0 ? rank - 2 : rank - 1;
 
   auto mfmaLayout = cast<AMDMfmaEncodingAttr>(encoding.getParent());
+
+  // tilesPerWarp parameter is only implemented trough LL path.
+  auto tilesPerWarp = mfmaLayout.getTilesPerWarp();
+  if (!mfmaLayout.hasUnitTilesPerWarp()) {
+    return Value();
+  }
+
   auto mDim = mfmaLayout.getMDim();
   auto nDim = mfmaLayout.getNDim();
   assert((mDim == nDim && (mDim == 32 || mDim == 16 || mDim == 4)) ||
          (mDim == 64 && nDim == 4) || (mDim == 4 && nDim == 64));
   auto warpsPerCTA = mfmaLayout.getWarpsPerCTA();
 
-  auto sharedLayout = cast<SwizzledSharedEncodingAttr>(aTensorTy.getEncoding());
+  auto sharedLayout =
+      dyn_cast<SwizzledSharedEncodingAttr>(aTensorTy.getEncoding());
+  if (!sharedLayout)
+    return Value();
   auto order = sharedLayout.getOrder();
-  assert((rank == 2 || order[2] == 0) &&
-         "expect batch to be the slowest dimension");
+
+  // Rely on the linear layout conversion logic in this case, since only slowest
+  // dimension for batch is supported here
+  if (rank != 2 && order.back() != 0)
+    return Value();
 
   auto elemTy = aTensorTy.getElementType();
   auto kWidth = encoding.getKWidth();
@@ -252,15 +276,17 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
     numRepK = numReps[kDimIdx + 1];
   }
 
-  unsigned iWarpSize = triton::gpu::getWarpSize(mfmaLayout);
+  unsigned iWarpSize = triton::gpu::lookupThreadsPerWarp(rewriter);
   assert(iWarpSize == 64);
   Value warpSize = tb.i32_val(iWarpSize);
   Value linearWarpId = tb.udiv(thread, warpSize);
   Value lane = tb.urem(thread, warpSize);
 
+  auto warpOrder = triton::gpu::getMatrixOrder(rank, /*rowMajor*/ true);
+
   Value spatialWarpId = AMD::getWarpIdInBlock(
       rewriter, loc, linearWarpId, warpsPerCTA, mfmaInstrNonK,
-      shape[nonKDimIdx], nonKDimIdx, triton::gpu::getOrder(mfmaLayout));
+      shape[nonKDimIdx], nonKDimIdx, warpOrder);
 
   // number of duplicates of elements in warp
   // In case of 64x4 x 4x4 multiplication, 4x4 B operand is duplicated 16 times
@@ -278,6 +304,7 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
   Value warpIdInBatch = tb.urem(linearWarpId, tb.i32_val(warpsPerBatch));
   elemTy = typeConverter->convertType(elemTy);
 
+  SmallVector<LLVM::LoadOp> llLoads;
   SmallVector<Value> loadedValues;
   SmallVector<Value> offsets;
   Value smemBase;
@@ -358,7 +385,8 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
                                k * loadsPerThread + loadId];
           loadOffset = tb.add(loadOffset, batchOffset);
           Value loadAddress = tb.gep(smemPtrTy, elemTy, smemBase, loadOffset);
-          Value loadedValue = tb.load(loadVecTy, loadAddress);
+          llLoads.push_back(tb.load(loadVecTy, loadAddress));
+          Value loadedValue = llLoads.back();
           for (int elemId = 0; elemId < elemsPerLoad; ++elemId) {
             Value elemVal =
                 tb.extract_element(elemTy, loadedValue, tb.i32_val(elemId));
@@ -371,9 +399,9 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
 
   for (auto op : tensor.getUsers()) {
     if (auto localLoadOp = llvm::dyn_cast<triton::gpu::LocalLoadOp>(op)) {
-      const size_t numDsReadsCount =
-          repB * numRepNonK * numRepK * loadsPerThread;
-      setNumGeneratedDsReads(localLoadOp, numDsReadsCount, loadVecTy);
+      for (auto llLoad : llLoads) {
+        AMD::addLocalLoadNoAliasScope(localLoadOp, llLoad);
+      }
     }
   }
 

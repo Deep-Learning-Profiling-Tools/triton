@@ -21,13 +21,11 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 #include "../PatternTritonGPUOpToLLVM.h"
-#include "../TritonAMDGPUToLLVM/SchedInstructions.h"
 #include "SharedToDotOperandHelper.h"
 #include "Utility.h"
 
 using ::mlir::triton::gpu::AMDWmmaEncodingAttr;
 using ::mlir::triton::gpu::DotOperandEncodingAttr;
-using ::mlir::triton::gpu::getOrder;
 using ::mlir::triton::gpu::getShapePerCTA;
 using ::mlir::triton::gpu::SwizzledSharedEncodingAttr;
 
@@ -155,30 +153,38 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
 
   auto aTensorTy = cast<triton::gpu::MemDescType>(tensor.getType());
   ArrayRef<int64_t> shape = aTensorTy.getShape();
-  auto sharedLayout = cast<SwizzledSharedEncodingAttr>(aTensorTy.getEncoding());
+  auto sharedLayout =
+      dyn_cast<SwizzledSharedEncodingAttr>(aTensorTy.getEncoding());
+  if (!sharedLayout)
+    return Value();
   auto order = sharedLayout.getOrder();
-  assert((rank == 2 || order[2] == 0) &&
-         "expect batch to be the slowest dimension");
+
+  // Rely on the linear layout conversion logic in this case, since only slowest
+  // dimension for batch is supported here
+  if (rank != 2 && order.back() != 0)
+    return Value();
 
   auto elemTy = aTensorTy.getElementType();
   int kWidth = encoding.getKWidth();
-  auto elemsPerInstr = wmmaLayout.getElemsPerInstrForOperands();
+
+  int kDim = (wmmaLayout.getVersion() == 2 && kWidth == 16) ? 32 : 16;
+  auto elemsPerInstr = wmmaLayout.getElemsPerInstrForOperands(kDim, opIdx);
   auto wmmaInstrK = elemsPerInstr[opIdx == 0 ? 1 : 0];
   auto wmmaInstrNonK = elemsPerInstr[opIdx == 0 ? 0 : 1];
   assert(wmmaInstrNonK == 16);
 
-  auto numReps = wmmaLayout.getRepForOperand(shape, elemTy, kWidth, opIdx);
+  auto numReps =
+      wmmaLayout.getRepForOperand(shape, elemTy, kWidth, kDim, opIdx);
   auto numRepNonK = numReps[opIdx == 0 ? 1 : 2];
   auto numRepK = numReps[opIdx == 0 ? 2 : 1];
   auto repB = numReps[0];
 
-  unsigned iWaveSize = triton::gpu::getWarpSize(wmmaLayout);
+  unsigned iWaveSize = triton::gpu::lookupThreadsPerWarp(rewriter);
   assert(iWaveSize == 32);
   Value waveSize = tb.i32_val(iWaveSize);
   Value linearWaveId = tb.udiv(thread, waveSize);
 
-  unsigned numElemsPerThreadPerRep =
-      wmmaLayout.getSizePerThreadForOperand(kWidth, opIdx)[kDimIdx];
+  unsigned numElemsPerThreadPerRep = kWidth;
 
   Value lane = tb.urem(thread, waveSize);
   unsigned int maxNumWarps = shape[nonKDimIdx] / wmmaInstrNonK;
@@ -192,9 +198,10 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
   SmallVector<Value> offsets;
   Value smemBase;
   auto smemStrides = smemObj.getStrides(aTensorTy, loc, rewriter);
+  auto warpOrder = triton::gpu::getMatrixOrder(rank, /*rowMajor*/ true);
   Value spatialWarpId = AMD::getWarpIdInBlock(
       rewriter, loc, linearWaveId, warpsPerCTA, elemsPerInstr[0],
-      shape[nonKDimIdx], nonKDimIdx, triton::gpu::getOrder(wmmaLayout));
+      shape[nonKDimIdx], nonKDimIdx, warpOrder);
   if (opIdx == 0) {
     offsets = AMD::computeOffsetsAType(
         rewriter, loc, computeTensorElemMappingInBlock, elemsPerInstr,
@@ -238,14 +245,6 @@ Value convertLayout(int opIdx, ConversionPatternRewriter &rewriter,
           }
         }
       }
-    }
-  }
-
-  for (auto op : tensor.getUsers()) {
-    if (auto localLoadOp = llvm::dyn_cast<triton::gpu::LocalLoadOp>(op)) {
-      const size_t numDsReadsCount =
-          repB * numRepNonK * numRepK * loadsPerThread;
-      setNumGeneratedDsReads(localLoadOp, numDsReadsCount, loadVecTy);
     }
   }
 

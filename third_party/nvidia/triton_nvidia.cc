@@ -1,9 +1,12 @@
 #include "Dialect/NVGPU/IR/Dialect.h"
-#include "NVGPUToLLVM/NVGPUToLLVMPass.h"
+#include "Dialect/NVWS/IR/Dialect.h"
+#include "NVGPUToLLVM/Passes.h"
 #include "TritonNVIDIAGPUToLLVM/Passes.h"
 #include "cublas_instance.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/NVVM/NVVMToLLVMIRTranslation.h"
+#include "nvidia/hopper/include/Transforms/Passes.h"
+#include "nvidia/include/Dialect/NVWS/Transforms/Passes.h"
 #include "passes.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/Passes.h"
@@ -13,6 +16,7 @@
 #include <pybind11/stl_bind.h>
 
 namespace py = pybind11;
+namespace ttng = mlir::triton::nvidia_gpu;
 
 void init_triton_nvidia_passes_ttgpuir(py::module &&m) {
   using namespace mlir::triton;
@@ -25,29 +29,67 @@ void init_triton_nvidia_passes_ttgpuir(py::module &&m) {
         });
 }
 
+static std::unique_ptr<mlir::Pass>
+createTritonGPUFenceInsertionWrapper(int32_t capability) {
+  ttng::TritonGPUFenceInsertionOptions options;
+  options.computeCapability = capability;
+  return ttng::createTritonGPUFenceInsertion(options);
+}
+
+static std::unique_ptr<mlir::Pass>
+createTritonGPUProxyFenceInsertionWrapper(int32_t capability) {
+  ttng::TritonGPUProxyFenceInsertionOptions options;
+  options.computeCapability = capability;
+  return ttng::createTritonGPUProxyFenceInsertion(options);
+}
+
 void init_triton_nvidia_passes_ttnvgpuir(py::module &&m) {
-  ADD_PASS_WRAPPER_1("add_plan_cta", mlir::createTritonNvidiaGPUPlanCTAPass,
+  ADD_PASS_WRAPPER_1("add_plan_cta", ttng::createTritonNvidiaGPUPlanCTAPass,
                      mlir::triton::nvidia_gpu::ClusterInfo *);
-  ADD_PASS_WRAPPER_0("add_fence_insertion",
-                     mlir::createTritonNvidiaGPUFenceInsertionPass);
+  ADD_PASS_WRAPPER_1("add_fence_insertion",
+                     createTritonGPUFenceInsertionWrapper, int32_t);
+  ADD_PASS_WRAPPER_1("add_proxy_fence_insertion",
+                     createTritonGPUProxyFenceInsertionWrapper, int32_t);
   ADD_PASS_WRAPPER_0("add_tma_lowering",
-                     mlir::createTritonNvidiaGPUTMALoweringPass);
-  ADD_PASS_WRAPPER_0("add_keep_acc_in_tmem",
-                     mlir::createTritonNvidiaGPUKeepAccInTMemPass);
+                     ttng::createTritonNvidiaGPUTMALoweringPass);
   ADD_PASS_WRAPPER_0("add_promote_lhs_to_tmem",
-                     mlir::createTritonNvidiaGPUPromoteLHSToTMemPass);
+                     ttng::createTritonNvidiaGPUPromoteLHSToTMemPass);
+  ADD_PASS_WRAPPER_0("add_remove_tmem_tokens",
+                     ttng::createTritonNvidiaGPURemoveTMEMTokensPass);
   ADD_PASS_WRAPPER_0("add_nvgpu_to_llvm",
-                     mlir::triton::createConvertNVGPUToLLVMPass);
+                     mlir::triton::createConvertNVGPUToLLVM);
+  ADD_PASS_WRAPPER_0("add_warp_specialize_to_llvm",
+                     mlir::triton::createConvertWarpSpecializeToLLVM);
   ADD_PASS_WRAPPER_0("add_allocate_tensor_memory",
-                     mlir::createTensorMemoryAllocationPass);
+                     ttng::createTritonTensorMemoryAllocationPass);
   ADD_PASS_WRAPPER_0("add_lower_mma",
-                     mlir::createTritonNvidiaGPUMMALoweringPass);
+                     ttng::createTritonNvidiaGPUMMALoweringPass);
+  ADD_PASS_WRAPPER_0("add_optimize_descriptor_encoding",
+                     ttng::createTritonNvidiaGPUOptimizeDescriptorEncodingPass);
+  ADD_PASS_WRAPPER_0("add_optimize_tmem_layouts",
+                     ttng::createTritonNvidiaGPUOptimizeTMemLayoutsPass);
+  ADD_PASS_WRAPPER_0("add_interleave_tmem",
+                     ttng::createTritonNvidiaGPUInterleaveTMemPass);
+}
+
+void init_triton_nvidia_passes_nvws(py::module &&m) {
+  ADD_PASS_WRAPPER_0("add_lower_warp_group",
+                     mlir::triton::createNVWSLowerWarpGroup);
+  ADD_PASS_WRAPPER_0("add_lower_aref", mlir::triton::createNVWSLowerAref);
+}
+
+void init_triton_hopper_passes(py::module &&m) {
+  // Meta's autoWS
+  ADD_PASS_OPTION_WRAPPER_2("add_hopper_warpspec",
+                            mlir::createNVGPUWarpSpecialization, int, bool);
 }
 
 void init_triton_nvidia(py::module &&m) {
   auto passes = m.def_submodule("passes");
+  init_triton_nvidia_passes_nvws(passes.def_submodule("nvws"));
   init_triton_nvidia_passes_ttgpuir(passes.def_submodule("ttgpuir"));
   init_triton_nvidia_passes_ttnvgpuir(passes.def_submodule("ttnvgpuir"));
+  init_triton_hopper_passes(passes.def_submodule("hopper"));
 
   // cluster info
   py::class_<mlir::triton::nvidia_gpu::ClusterInfo>(m, "ClusterInfo")
@@ -70,9 +112,21 @@ void init_triton_nvidia(py::module &&m) {
     mlir::DialectRegistry registry;
     registry.insert<mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,
                     mlir::triton::nvgpu::NVGPUDialect>();
+    registry.insert<mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,
+                    mlir::triton::nvws::NVWSDialect>();
     mlir::registerNVVMDialectTranslation(registry);
     context.appendDialectRegistry(registry);
     context.loadAllAvailableDialects();
+  });
+
+  // Set short point option, this needs to be set before setting the data
+  // layout.
+  m.def("set_short_ptr", []() {
+    auto options = llvm::cl::getRegisteredOptions();
+    const char *flag = "nvptx-short-ptr";
+    auto *shortPtr = static_cast<llvm::cl::opt<bool> *>(options[flag]);
+    assert(shortPtr);
+    shortPtr->setValue(true);
   });
 
   // TODO: could be done in python if we had a generic interface to set metadata

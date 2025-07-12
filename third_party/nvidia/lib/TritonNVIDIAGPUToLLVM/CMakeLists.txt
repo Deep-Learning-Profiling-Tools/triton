@@ -1,5 +1,6 @@
 add_triton_library(TritonNVIDIAGPUToLLVM
     ConvertLayoutOpToLLVM.cpp
+    ConvertWarpSpecializeToLLVM.cpp
     MemoryOpToLLVM.cpp
     DotOpToLLVM/MMAv2.cpp
     DotOpToLLVM/MMAv5.cpp
@@ -26,4 +27,6 @@ add_triton_library(TritonNVIDIAGPUToLLVM
     LINK_LIBS PUBLIC
     TritonGPUToLLVM
     TritonProtonToLLVM
+    TritonInstrumentToLLVM
+    MLIRReconcileUnrealizedCasts
 )

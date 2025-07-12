@@ -3,6 +3,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
+#include "triton/Tools/LayoutUtils.h"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -97,6 +98,44 @@ struct ArithConstantSplatOpConversion
     return success();
   }
 };
+
+// Convert arith::ConstantOp with an array DenseElementsAttr to a
+// LLVM::StructType value.
+struct ArithConstantArrayOpConversion
+    : public ConvertOpToLLVMPattern<arith::ConstantOp> {
+  using ConvertOpToLLVMPattern<arith::ConstantOp>::ConvertOpToLLVMPattern;
+  LogicalResult
+  matchAndRewrite(arith::ConstantOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto value = op.getValue();
+    if (!mlir::dyn_cast<DenseElementsAttr>(value))
+      return failure();
+    if (mlir::isa<SplatElementsAttr>(value))
+      return failure();
+    auto tensorTy = cast<RankedTensorType>(op.getType());
+    auto loc = op->getLoc();
+    auto values = mlir::dyn_cast<DenseElementsAttr>(op.getValue());
+    auto elemType = values.getElementType();
+    SmallVector<Value> llVals;
+    for (auto v : values.getValues<APInt>()) {
+      auto ll = rewriter.create<LLVM::ConstantOp>(loc, elemType, v);
+      llVals.push_back(ll);
+    }
+    size_t elemsPerThread = getTotalElemsPerThread(tensorTy);
+
+    if (elemsPerThread != llVals.size()) {
+      op->emitError(
+          "Right now we only support constant arrays with the same number of "
+          "elements as the number of threads per warp");
+      return failure();
+    }
+    auto llStruct =
+        packLLElements(loc, getTypeConverter(), llVals, rewriter, op.getType());
+    rewriter.replaceOp(op, {llStruct});
+    return success();
+  }
+};
+
 struct CatOpConversion : public ConvertOpToLLVMPattern<CatOp> {
   using OpAdaptor = typename CatOp::Adaptor;
   explicit CatOpConversion(LLVMTypeConverter &typeConverter,
@@ -137,29 +176,46 @@ struct JoinOpConversion : public ConvertOpToLLVMPattern<JoinOp> {
     // We rely on the following invariants of this op (which are checked by its
     // verifier):
     //
-    // - The op has a blocked encoding.
     // - The last dimension (the one we're joining) is also the most minor
     //   dimension.
     // - The input and output encodings are the same, except the output has
     //   2 elements per thread in the last dim.
     //
-    // With these invariants, join is trivial: We just return the i'th element
-    // from lhs, followed by the i'th elem from rhs.
+    // With these invariants, join is trivial: We can count how many contiguous
+    // registers belong to the same chunk then we merge the registers between
+    // two different chunks.
     Location loc = op->getLoc();
-    auto resultTy = cast<RankedTensorType>(op.getType());
-    auto typeConverter = getTypeConverter();
+    RankedTensorType dstTy = op.getType();
+    auto ll = toLinearLayout(dstTy);
+    int splitDim = dstTy.getRank() - 1;
+    auto kReg = mlir::StringAttr::get(dstTy.getContext(), "register");
+    const auto &bases = ll.getBases();
+    const auto &regs = bases.find(kReg)->second;
+    int numContiguousValues = 1;
+    bool found = false;
+    for (const auto &reg : regs) {
+      if (reg[splitDim] == 1) {
+        found = true;
+        break;
+      }
+      numContiguousValues *= 2;
+    }
+    assert(found && "Join dimension is not distributed along registers.");
     SmallVector<Value> lhsVals =
         unpackLLElements(loc, adaptor.getLhs(), rewriter);
     SmallVector<Value> rhsVals =
         unpackLLElements(loc, adaptor.getRhs(), rewriter);
     assert(lhsVals.size() == rhsVals.size());
     SmallVector<Value> joinedVals;
-    for (int i = 0; i < lhsVals.size(); i++) {
-      joinedVals.push_back(lhsVals[i]);
-      joinedVals.push_back(rhsVals[i]);
+    joinedVals.resize(lhsVals.size() * 2);
+    for (int i = 0; i < lhsVals.size(); i += numContiguousValues) {
+      for (int j = 0; j < numContiguousValues; j++) {
+        joinedVals[2 * i + j] = lhsVals[i + j];
+        joinedVals[2 * i + numContiguousValues + j] = rhsVals[i + j];
+      }
     }
-    Value ret =
-        packLLElements(loc, typeConverter, joinedVals, rewriter, resultTy);
+    auto typeConverter = getTypeConverter();
+    Value ret = packLLElements(loc, typeConverter, joinedVals, rewriter, dstTy);
     rewriter.replaceOp(op, ret);
     return success();
   }
@@ -173,22 +229,29 @@ struct SplitOpConversion : public ConvertOpToLLVMPattern<SplitOp> {
     // We rely on the following invariants of this op (which are checked by its
     // verifier):
     //
-    // - The op has a blocked encoding.
+    // - The layout distribute the last dimension along registers
     // - The last dimension (the one we're splitting) has sizePerThread=2,
     // threadPerWarp=1 and warpPerBlock=1.
     //
     // With these invariants, split is trivial: We can count how many contiguous
     // registers belong to the same chunk then we separate the registers between
     // two different chunks.
+    auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
+    auto ll = toLinearLayout(srcTy);
+    int splitDim = srcTy.getRank() - 1;
+    auto kReg = mlir::StringAttr::get(srcTy.getContext(), "register");
+    const auto &bases = ll.getBases();
+    const auto &regs = bases.find(kReg)->second;
     int numContiguousValues = 1;
-    auto encoding = cast<BlockedEncodingAttr>(
-        cast<RankedTensorType>(op.getSrc().getType()).getEncoding());
-    int splitDim = encoding.getOrder().size() - 1;
-    for (int i = 0; i < encoding.getOrder().size(); i++) {
-      if (encoding.getOrder()[i] == splitDim)
+    bool found = false;
+    for (const auto &reg : regs) {
+      if (reg[splitDim] == 1) {
+        found = true;
         break;
-      numContiguousValues *= encoding.getSizePerThread()[i];
+      }
+      numContiguousValues *= 2;
     }
+    assert(found && "Split dimension is not distributed along registers.");
     Location loc = op->getLoc();
     auto typeConverter = getTypeConverter();
     SmallVector<Value> srcVals =
@@ -292,6 +355,37 @@ struct MemDescTransOpConversion
   }
 };
 
+struct MemDescReshapeOpConversion
+    : public ConvertOpToLLVMPattern<MemDescReshapeOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+  LogicalResult
+  matchAndRewrite(MemDescReshapeOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op->getLoc();
+    auto resultTy = cast<TensorOrMemDesc>(op.getType());
+    auto llvmElemTy =
+        getTypeConverter()->convertType(resultTy.getElementType());
+    auto srcSmemObj = getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
+                                                      llvmElemTy, rewriter);
+    SmallVector<Value> offsets = srcSmemObj.getOffsets();
+    SmallVector<unsigned> srcShape;
+    for (int64_t d : op.getSrc().getType().getShape())
+      srcShape.push_back(d);
+    SmallVector<unsigned> dstShape;
+    for (int64_t d : op.getType().getShape())
+      dstShape.push_back(d);
+    Value linearOffset = LLVM::linearize(rewriter, loc, offsets, srcShape);
+    SmallVector<Value> delinearizedOffset =
+        LLVM::delinearize(rewriter, loc, linearOffset, dstShape);
+    auto b = TritonLLVMOpBuilder(loc, rewriter);
+    auto dstSmemObj = SharedMemoryObject(
+        srcSmemObj.getBase(), srcSmemObj.getBaseElemType(), delinearizedOffset);
+    auto retVal = getStructFromSharedMemoryObject(loc, dstSmemObj, rewriter);
+    rewriter.replaceOp(op, retVal);
+    return success();
+  }
+};
+
 struct TransOpConversion : public ConvertOpToLLVMPattern<TransOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
   LogicalResult
@@ -366,36 +460,94 @@ struct MemDescSubviewOpConversion
   matchAndRewrite(triton::gpu::MemDescSubviewOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
+    auto *ctx = op->getContext();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     auto srcTy = op.getSrc().getType();
+    auto destTy = op.getResult().getType();
     auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
-    auto layoutOrder = getOrder(srcTy.getEncoding());
+    auto layoutOrder = getOrder(srcTy);
+    auto enc = srcTy.getEncoding();
 
     // newBase = base + offset
     auto smemObj = getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
                                                    llvmElemTy, rewriter);
     auto smemStrides = smemObj.getStrides(srcTy, loc, rewriter);
     SmallVector<Value> opOffsetVals = op.getOffsets();
+    // We assume we always create a subview of the last dimensions
     SmallVector<Value> opSmemStrides(smemStrides.end() - opOffsetVals.size(),
                                      smemStrides.end());
+    // Compute total offset
     SmallVector<Value> offsetVals;
     auto destRank = op.getResult().getType().getRank();
     auto rankReduced = srcTy.getRank() - destRank;
     for (int i = rankReduced; i < opOffsetVals.size(); i++) {
       offsetVals.push_back(b.add(opOffsetVals[i], smemObj.getOffsets()[i]));
     }
-    // Compute the offset based on the original strides of the shared memory
-    // object
-    auto offset = dot(rewriter, loc, opOffsetVals, opSmemStrides);
-    auto elemPtrTy = smemObj.getBase().getType();
-    smemObj = SharedMemoryObject(
-        b.gep(elemPtrTy, llvmElemTy, smemObj.getBase(), offset), llvmElemTy,
-        offsetVals);
+
+    Value offset;
+    if (rankReduced || (destTy.getRank() == 1 && destTy.getDimSize(0) == 1)) {
+      // We are splitting the pipelining dimension which may not be a power of 2
+      // so we can't use LinearLayouts
+      offset = dot(rewriter, loc, opOffsetVals, opSmemStrides);
+    } else {
+      auto dimNames = standardOutDimNames(ctx, opOffsetVals.size());
+      SmallVector<std::pair<StringAttr, Value>> logicalOffsets;
+      // This assumes the subviews are additive, in the sense that we can
+      // compute the offset of one and an add it to the offset of the previous
+      // one we computed. We check for this in the verifier.
+      for (int i = 0; i < rankReduced; i++) {
+        logicalOffsets.push_back({dimNames[i], b.i32_val(0)});
+      }
+      for (int i = rankReduced; i < opOffsetVals.size(); i++) {
+        logicalOffsets.push_back({dimNames[i], offsetVals[i - rankReduced]});
+      }
+      auto ll = toLinearLayout(srcTy);
+      // Checked in the verifier.
+      assert(ll.getInDimSize(str_attr("block")) == 1);
+      auto kOffset = str_attr("offset");
+      ll = ll.reshapeIns({{kOffset, ll.getTotalInDimSize()}});
+      offset = applyLinearLayout(loc, rewriter, ll.invert(), logicalOffsets)[0]
+                   .second;
+    }
+
+    if (auto paddedLayout = dyn_cast<triton::gpu::PaddedSharedEncodingAttr>(
+            srcTy.getEncoding())) {
+      // Apply padding based on the computed offset
+      Value padOffset = emitPadding(loc, rewriter, paddedLayout, offset);
+      offset = b.add(offset, padOffset);
+    }
+
+    auto base = smemObj.getBase();
+    auto elemPtrTy = base.getType();
+    smemObj = SharedMemoryObject(b.gep(elemPtrTy, llvmElemTy, base, offset),
+                                 llvmElemTy, offsetVals);
     auto retVal = getStructFromSharedMemoryObject(loc, smemObj, rewriter);
     rewriter.replaceOp(op, retVal);
     return success();
   }
 };
+
+struct MemDescReinterpretOpConversion
+    : public ConvertOpToLLVMPattern<MemDescReinterpretOp> {
+  using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
+
+  LogicalResult matchAndRewrite(MemDescReinterpretOp op, OpAdaptor adaptor,
+                                ConversionPatternRewriter &b) const override {
+    Location loc = op.getLoc();
+    MemDescType srcTy = op.getSrc().getType();
+    MemDescType dstTy = op.getType();
+    Type srcElemTy = getTypeConverter()->convertType(srcTy.getElementType());
+    Type dstElemTy = getTypeConverter()->convertType(dstTy.getElementType());
+
+    auto smemObj =
+        getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(), srcElemTy, b);
+    SharedMemoryObject newObj(smemObj.getBase(), dstElemTy, dstTy.getRank(),
+                              loc, b);
+    b.replaceOp(op, getStructFromSharedMemoryObject(loc, newObj, b));
+    return success();
+  }
+};
+
 } // namespace
 
 void mlir::triton::populateViewOpToLLVMPatterns(
@@ -405,11 +557,14 @@ void mlir::triton::populateViewOpToLLVMPatterns(
   patterns.add<ExpandDimsOpConversion>(typeConverter, benefit);
   patterns.add<SplatOpConversion>(typeConverter, benefit);
   patterns.add<ArithConstantSplatOpConversion>(typeConverter, benefit);
+  patterns.add<ArithConstantArrayOpConversion>(typeConverter, benefit);
   patterns.add<CatOpConversion>(typeConverter, benefit);
   patterns.add<JoinOpConversion>(typeConverter, benefit);
   patterns.add<SplitOpConversion>(typeConverter, benefit);
-  patterns.add<MemDescTransOpConversion>(typeConverter, benefit);
+  patterns.add<MemDescTransOpConversion, MemDescReshapeOpConversion>(
+      typeConverter, benefit);
   patterns.add<TransOpConversion>(typeConverter, benefit);
   patterns.add<BroadcastOpConversion>(typeConverter, benefit);
   patterns.add<MemDescSubviewOpConversion>(typeConverter, benefit);
+  patterns.add<MemDescReinterpretOpConversion>(typeConverter, benefit);
 }

@@ -27,6 +27,7 @@ public:
   explicit ReduceOpHelper(triton::ReduceOp op)
       : op(op.getOperation()), axis(op.getAxis()) {
     auto firstTy = cast<RankedTensorType>(op.getOperands()[0].getType());
+    srcTy = firstTy;
     srcShape = firstTy.getShape();
     srcEncoding = firstTy.getEncoding();
     srcElementTypes = op.getElementTypes();
@@ -47,21 +48,13 @@ public:
 
   triton::ReduceOp getOperation() { return op; }
 
-  bool isReductionOnLayoutFastAxis();
-
   unsigned getThreadOffsetOnReductionAxis();
 
   bool isWarpSynchronous();
 
-  unsigned getInterWarpSize();
-
-  unsigned getIntraWarpSize();
-
   unsigned getInterWarpSizeWithUniqueData();
 
   unsigned getIntraWarpSizeWithUniqueData();
-
-  unsigned getThreadsReductionAxis();
 
   // The shape of the shared memory space needed for the reduction.
   SmallVector<unsigned> getScratchRepShape();
@@ -70,14 +63,13 @@ public:
 
   unsigned getScratchSizeInBytes();
 
-  bool isSupportedLayout();
-
   bool isReduceWithinCTA();
 
-  unsigned getAxis() { return axis; }
+  bool isAssociative();
 
 private:
   triton::ReduceOp op;
+  RankedTensorType srcTy;
   ArrayRef<int64_t> srcShape;
   Attribute srcEncoding;
   SmallVector<Type> srcElementTypes;
@@ -90,7 +82,7 @@ public:
     auto firstTy = cast<RankedTensorType>(op.getOperands()[0].getType());
     srcShape = firstTy.getShape();
     legacyEncoding = firstTy.getEncoding();
-    srcEncoding = triton::gpu::toLinearEncoding(legacyEncoding, srcShape);
+    srcEncoding = triton::gpu::toLinearEncoding(firstTy);
     srcElementTypes = op.getElementTypes();
     // The codegen does not support different element/thread/warp order so
     // we choose one a priori. We choose that of the blocked encoding.
@@ -176,6 +168,8 @@ public:
 
 private:
   triton::GatherOp gatherOp;
+  RankedTensorType srcTy;
+  RankedTensorType dstTy;
 };
 
 // This struct represents a decomposed layout conversion within a warp into
@@ -237,8 +231,7 @@ bool supportMMA(Value value, int version);
 // return nullopt). The output will be such that layout.getInDimNames() ==
 // layout.getOutDimNames() and the conversion will not include kBlock (resp.
 // kWarp or kLane) if it can be avoided
-triton::LinearLayout minimalCvtLayout(RankedTensorType srcTy,
-                                      RankedTensorType dstTy);
+triton::LinearLayout minimalCvtLayout(Type srcTy, Type dstTy);
 
 // Conversion from `srcTy` to `dstTy` only involves reordering of registers.
 // There is no need for data exchange across threads, warps, or blocks.
@@ -253,8 +246,6 @@ bool cvtNeedsWarpShuffle(RankedTensorType srcTy, RankedTensorType dstTy);
 bool cvtNeedsSharedMemory(RankedTensorType srcTy, RankedTensorType dstTy);
 
 bool atomicNeedsSharedMemory(Value result);
-
-bool isBlockedToDotShortcut(RankedTensorType srcTy, RankedTensorType dstTy);
 
 // Return true if the src and dst layout match.
 bool matchMmaV3AndDotOperandLayout(RankedTensorType srcTy,
@@ -425,8 +416,6 @@ protected:
 };
 // Create a basic DataFlowSolver with constant and dead code analysis included.
 std::unique_ptr<DataFlowSolver> createDataFlowSolver();
-
-triton::MakeTensorPtrOp getMakeTensorPtrOp(Value v);
 
 } // namespace mlir
 

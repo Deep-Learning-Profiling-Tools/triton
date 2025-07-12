@@ -1,9 +1,11 @@
+#include "AsyncUtility.h"
 #include "PatternTritonGPUOpToLLVM.h"
 #include "Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/PatternTritonGPUOpToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
+using ::mlir::LLVM::AMD::isUsedByDotScaledOp;
 using ::mlir::triton::gpu::AMDMfmaEncodingAttr;
 using ::mlir::triton::gpu::AMDWmmaEncodingAttr;
 using ::mlir::triton::gpu::DotOperandEncodingAttr;
@@ -52,7 +54,7 @@ private:
   /// MFMA or WMMA.
   ///
   /// \returns value with packed loaded values or empty value if this local_load
-  /// is not supproted.
+  /// is not supported.
   Value lowerSharedToDotOperandMMA(
       triton::gpu::LocalLoadOp op, triton::gpu::LocalLoadOpAdaptor adaptor,
       const LLVMTypeConverter *typeConverter,
@@ -75,7 +77,7 @@ private:
                                     : SharedToDotOperandWMMA::convertLayout;
       res = sharedToDotConvert(dotOperandLayout.getOpIdx(), rewriter, loc, src,
                                dotOperandLayout, smemObj, typeConverter,
-                               b.tid_val());
+                               getThreadId(rewriter, loc));
     } else {
       assert(false && "unsupported layout found");
     }
@@ -118,7 +120,7 @@ public:
     Attribute srcLayout = srcTy.getEncoding();
     Attribute dstLayout = dstTy.getEncoding();
 
-    if (canUseTransLoad(srcTy, dstTy)) {
+    if (canUseTransLoad(op, srcTy, dstTy)) {
       return lowerSharedToDotOperandTransLL(op, adaptor, getTypeConverter(),
                                             rewriter);
     }
@@ -140,6 +142,11 @@ private:
       return false;
     }
 
+    auto tilesPerWarp = mfmaEnc.getTilesPerWarp();
+    if (!mfmaEnc.hasUnitTilesPerWarp()) {
+      return false;
+    }
+
     auto sharedEnc =
         dyn_cast<triton::gpu::SwizzledSharedEncodingAttr>(srcTy.getEncoding());
     if (!sharedEnc)
@@ -150,41 +157,78 @@ private:
     return kDim != sharedEnc.getOrder()[0];
   }
 
-  bool checkPerformanceProperties(MemDescType srcTy,
-                                  RankedTensorType dstTy) const {
-    // The transposed load lowering logic assumes that double-rate MFMA (
-    // mfma32x32x16 and mfma16x16x32) instructions are used whenever possible.
-    // This code verifies whether double-rate MFMA instructions are being used
-    // and falls back to the default path if they are not. (Note: The lowering
-    // logic for double-rate MFMA is the same as for single-rate (mfma32x32x8
-    // and mfma16x16x16) with kpack=2). This check should be removed once
-    // double-rate MFMA support is fully implemented in the compiler, leaving
-    // only an assertion. Currently, single-rate configurations with kpack=1 are
-    // still in use, so in such cases, we revert to the default lowering logic
-    // without LDS transpose read instructions.
+  bool checkKWidth(MemDescType srcTy, RankedTensorType dstTy) const {
+    // Single rate MFMA insts:
+    // fp16, bf16: mfma32x32x8, mfma16x16x16
+    // fp8, bf8: mfma32x32x16, mfma16x16x32
+    // int8: mfma32x32x16, mfma16x16x32
+    //
+    // Double rate MFMA insts:
+    // fp16, bf16: mfma32x32x16, mfma16x16x32
+    // fp8, bf8: mfma32x32x64, mfma16x16x128
+    // int8: mfma32x32x32, mfma16x16x64
+    //
+    // Check that kWidth of the dst dotOp layout is large enough to
+    // work with the transposed lds load instructions.
     auto dotEnc = llvm::cast<DotOperandEncodingAttr>(dstTy.getEncoding());
     auto mfmaEnc = llvm::cast<AMDMfmaEncodingAttr>(dotEnc.getParent());
 
     int rank = dstTy.getRank();
+    auto bitwidth = typeConverter->convertType(dstTy.getElementType())
+                        .getIntOrFloatBitWidth();
     int32_t kWidth = dotEnc.getKWidth();
     const int32_t mDim = mfmaEnc.getMDim();
     assert((mDim == 32 || mDim == 16) && "Invalid MFMA instruction dimension");
 
-    // Single rate MFMA insts: mfma32x32x8, mfma16x16x16
-    const int kSize16bSingleRateMfma32 = 8;
-    const int kSize16bSingleRateMfma16 = 16;
-    const int largeTileThreshold16b =
-        (mDim == 32) ? kSize16bSingleRateMfma32 : kSize16bSingleRateMfma16;
+    const int kFactor = 16 / bitwidth;
+    const int kSizeDoubleRateMfma32 = 16 * kFactor;
+    const int kSizeDoubleRateMfma16 = 32 * kFactor;
+    int largeTileThreshold =
+        (mDim == 32) ? kSizeDoubleRateMfma32 : kSizeDoubleRateMfma16;
+
+    // For FP8, wider MFMA instructions (scaled MFMA) have a k-dimension
+    // that is four times of regular MFMA instructions.
+    if (dstTy.getElementType().isFloat() && bitwidth == 8) {
+      largeTileThreshold *= 2;
+    }
+
     const auto shape = dstTy.getShape();
     const int kDim = dotEnc.getOpIdx() == 0 ? rank - 1 : rank - 2;
+    const bool isLargeTile = shape[kDim] >= largeTileThreshold;
 
-    const bool isLargeTile16b = shape[kDim] > largeTileThreshold16b;
-    const int expectedKWidth16b = isLargeTile16b ? 8 : 4;
-
-    return kWidth == expectedKWidth16b;
+    const int kWidthLargeTile = 8 * kFactor;
+    const int kWidthSmallTile = 4 * kFactor;
+    // For largeTile, i.e. double rated mfma is an option, it's accepted to
+    // have kWidth set for both double and single rated mfma
+    // For smallTile, it's only accepted to have kWidth set to single rate
+    // mfma. Smaller kWidth is not allowed to use transposed lds load.
+    return (isLargeTile &&
+            llvm::is_contained({kWidthLargeTile, kWidthSmallTile}, kWidth)) ||
+           (kWidth == kWidthSmallTile);
   }
 
-  bool canUseTransLoad(MemDescType srcTy, RankedTensorType dstTy) const {
+  bool checkCurrentLimitation(Operation *localLoad,
+                              RankedTensorType dstTy) const {
+
+    auto bitwidth = typeConverter->convertType(dstTy.getElementType())
+                        .getIntOrFloatBitWidth();
+
+    // Triton does not natively support the FP4 type, so it is packed and
+    // represented as an i8. Currently, the only way to distinguish FP4 from an
+    // actual int8 is by checking whether the localLoad is used in a scaled dot
+    // operation, as int8 is never used in one.
+    bool isFP4 = isUsedByDotScaledOp(localLoad) && bitwidth == 8 &&
+                 dstTy.getElementType().isInteger();
+
+    if (isFP4 || (bitwidth != 16 && bitwidth != 8)) {
+      return false;
+    }
+
+    return true;
+  }
+
+  bool canUseTransLoad(Operation *localLoad, MemDescType srcTy,
+                       RankedTensorType dstTy) const {
     auto bitwidth = typeConverter->convertType(dstTy.getElementType())
                         .getIntOrFloatBitWidth();
 
@@ -198,13 +242,13 @@ private:
       return false;
     }
 
-    // 3. Check performance properties.
-    if (!checkPerformanceProperties(srcTy, dstTy)) {
+    // 3. Check current limitations.
+    if (!checkCurrentLimitation(localLoad, dstTy)) {
       return false;
     }
 
-    // 4. Check current limitations.
-    if (bitwidth != 16) {
+    // 4. Check kWidth
+    if (!checkKWidth(srcTy, dstTy)) {
       return false;
     }
 
@@ -226,25 +270,58 @@ private:
 
     auto llvmElemTy = typeConverter->convertType(dstTy.getElementType());
     auto bitwidth = llvmElemTy.getIntOrFloatBitWidth();
-    auto dsReadTransLayout = chooseDsReadB64Tr16Layout(dotEnc, shape, bitwidth);
+    auto ldsTransLayout = chooseDsReadB64TrLayout(dotEnc, shape, bitwidth);
     auto smemObj = LLVM::getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
                                                          llvmElemTy, rewriter);
     SmallVector<Value> outVals;
+    SmallVector<Value> elemsI32;
+    mlir::Type retTy = dstTy;
+    auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
     bool valid = emitTransferBetweenRegistersAndShared(
-        dsReadTransLayout, srcTy, llvmElemTy,
+        ldsTransLayout, srcTy, llvmElemTy,
         /*maxVecElems=*/std::nullopt, smemObj, loc, rewriter, targetInfo,
-        [&](VectorType vecTy, Value vecAddr) {
-          auto dsReadOp =
-              rewriter.create<ROCDL::ds_read_tr16_b64>(loc, vecTy, vecAddr);
-          Value vecVal = dsReadOp.getResult();
-          for (int v = 0; v < vecTy.getNumElements(); v++) {
-            outVals.push_back(
-                b.extract_element(llvmElemTy, vecVal, b.i32_val(v)));
+        laneId, warpId, [&](VectorType vecTy, Value vecAddr) {
+          if (bitwidth == 16) {
+            auto dsReadOp =
+                rewriter.create<ROCDL::ds_read_tr16_b64>(loc, vecTy, vecAddr);
+            AMD::addLocalLoadNoAliasScope(op, dsReadOp);
+            Value vecVal = dsReadOp.getResult();
+            for (int v = 0; v < vecTy.getNumElements(); v++) {
+              outVals.push_back(
+                  b.extract_element(llvmElemTy, vecVal, b.i32_val(v)));
+            }
+          } else {
+            // pack elements in i32 vectors
+            auto numElems = vecTy.getNumElements();
+            auto numElemsI32 = (numElems * bitwidth / 32);
+            auto i32VecTy = VectorType::get(numElemsI32, i32_ty);
+
+            auto dsReadOp =
+                rewriter.create<ROCDL::ds_read_tr8_b64>(loc, i32VecTy, vecAddr);
+            AMD::addLocalLoadNoAliasScope(op, dsReadOp);
+            Value vecVal = dsReadOp.getResult();
+            for (auto i = 0; i < numElemsI32; ++i) {
+              elemsI32.push_back(
+                  b.extract_element(i32_ty, vecVal, b.i32_val(i)));
+            }
           }
         });
 
+    // unpack i32 vectors and cast to native type
+    if (bitwidth != 16) {
+      auto numElemsPerVec = 32 / bitwidth;
+      auto vecTy = vec_ty(llvmElemTy, numElemsPerVec);
+      for (int v = 0; v < static_cast<int>(elemsI32.size()); ++v) {
+        auto vec = b.bitcast(elemsI32[v], vecTy);
+        for (int i = 0; i < numElemsPerVec; ++i)
+          outVals.push_back(b.extract_element(llvmElemTy, vec, b.i32_val(i)));
+      }
+
+      retTy = LLVM::LLVMStructType::getLiteral(
+          ctx, SmallVector<Type>(outVals.size(), llvmElemTy));
+    }
     assert(valid && "Failed to emit LDS transpose load operations");
-    Value result = packLLElements(loc, typeConverter, outVals, rewriter, dstTy);
+    Value result = packLLElements(loc, typeConverter, outVals, rewriter, retTy);
     rewriter.replaceOp(op, result);
     return success();
   }

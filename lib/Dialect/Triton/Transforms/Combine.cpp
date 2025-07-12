@@ -1,5 +1,3 @@
-#include <memory>
-
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
@@ -8,12 +6,14 @@
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/DiscardableAttributes.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 
-#define GEN_PASS_CLASSES
+namespace mlir::triton {
+
+#define GEN_PASS_DEF_TRITONCOMBINEOPS
 #include "triton/Dialect/Triton/Transforms/Passes.h.inc"
 
-namespace mlir::triton {
 namespace {
 
 bool isZero(Value val) {
@@ -217,8 +217,7 @@ public:
   mlir::LogicalResult
   matchAndRewrite(triton::ReshapeOp reshapeOp,
                   mlir::PatternRewriter &rewriter) const override {
-    auto loadDef = reshapeOp.getSrc()
-                       .getDefiningOp<triton::ExperimentalDescriptorLoadOp>();
+    auto loadDef = reshapeOp.getSrc().getDefiningOp<triton::DescriptorLoadOp>();
     if (!loadDef || !loadDef->hasOneUse())
       return failure();
     int loadRank = loadDef.getType().getRank();
@@ -241,7 +240,9 @@ public:
   }
 };
 
-class CombineOpsPass : public TritonCombineOpsBase<CombineOpsPass> {
+} // anonymous namespace
+
+class CombineOpsPass : public impl::TritonCombineOpsBase<CombineOpsPass> {
 public:
   void runOnOperation() override {
     MLIRContext *context = &getContext();
@@ -264,11 +265,5 @@ public:
       signalPassFailure();
   }
 };
-
-} // anonymous namespace
-
-std::unique_ptr<mlir::Pass> createCombineOpsPass() {
-  return std::make_unique<CombineOpsPass>();
-}
 
 } // namespace mlir::triton
