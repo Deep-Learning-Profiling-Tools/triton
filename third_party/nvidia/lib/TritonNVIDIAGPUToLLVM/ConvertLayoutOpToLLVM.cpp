@@ -38,10 +38,6 @@ public:
       if (shouldUseDistSmem(srcLayout, dstLayout))
         return lowerDistToDistWithDistSmem(op, adaptor, rewriter, targetInfo);
     }
-    if (isa<NvidiaMmaEncodingAttr>(srcLayout) &&
-        isa<DotOperandEncodingAttr>(dstLayout)) {
-      return lowerMmaToDotOperand(op, adaptor, rewriter);
-    }
 
     return failure();
   }

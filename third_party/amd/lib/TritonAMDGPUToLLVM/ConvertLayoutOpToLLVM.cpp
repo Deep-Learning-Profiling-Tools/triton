@@ -292,8 +292,8 @@ protected:
 void mlir::triton::AMD::populateConvertLayoutOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfo &targetInfo,
     RewritePatternSet &patterns, PatternBenefit benefit) {
-  patterns.add<ConvertLayoutOpMFMAToDotOpConversion>(typeConverter, targetInfo,
-                                                     benefit);
-  patterns.add<ConvertLayoutOpMFMAToLinearConversion>(typeConverter, targetInfo,
-                                                      benefit);
+  //patterns.add<ConvertLayoutOpMFMAToDotOpConversion>(typeConverter, targetInfo,
+  //                                                   benefit);
+  //patterns.add<ConvertLayoutOpMFMAToLinearConversion>(typeConverter, targetInfo,
+  //                                                    benefit);
 }
